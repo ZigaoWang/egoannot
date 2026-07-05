@@ -29,8 +29,13 @@ from typing import Any
 import streamlit as st
 from sqlalchemy import desc, select
 
-from .config import get_settings
-from .db import Annotation, TaskResult, Video, init_engine, session_scope
+# Streamlit runs this file via `streamlit run <path>`, which loads it as
+# ``__main__`` — not as ``egoannot.dashboard``. Relative imports would
+# raise ``ImportError: attempted relative import with no known parent``.
+# Use absolute imports so both entrypoints (Typer CLI and direct
+# ``streamlit run``) work.
+from egoannot.config import get_settings
+from egoannot.db import Annotation, TaskResult, Video, init_engine, session_scope
 
 
 def _boot_once() -> None:
