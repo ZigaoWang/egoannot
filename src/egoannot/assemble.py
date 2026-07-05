@@ -9,12 +9,19 @@ time_spans to ``[0, duration_sec]``, and validates the whole thing against
 Aggregation rules across segments:
     - ``environment``: taken from the FIRST segment's scene response.
     - ``scene_category``: taken from the FIRST segment's scene response.
-    - ``caption``: concatenation of each segment's caption, separated by
-      ``"; "``. Empty when no caption succeeded.
+    - ``caption``: SINGLE-SEGMENT videos use the segment caption directly.
+      MULTI-SEGMENT videos issue ONE additional text-only synthesis call
+      (task ``caption_merge``) that takes the per-segment captions plus a
+      compact scene summary and produces one coherent first-person
+      caption. If the merge call is unavailable (no client passed or the
+      call fails), we fall back to a length-safe join of segment captions.
+      Regardless of source, the final caption is clamped to the schema
+      max length at a sentence boundary.
     - ``key_elements``: union across segments. Entries with the same label
       are merged into a single row with the widest time_span; the maximum
       importance is retained.
-    - ``risk_labels``: concatenation of every risk from every segment.
+    - ``risk_labels``: concatenation of every risk from every segment;
+      each ``description`` is clamped to the RiskLabel max length.
     - ``walkability``: worst across segments (not_passable > with_caution
       > passable > unknown).
     - ``acceptable_actions``: union across segments, ordered stably.
@@ -28,6 +35,13 @@ Time-span clamping:
     Every [start, end] pair in key_elements, risk_labels, and qa
     evidence_time_span is clamped to [0, duration_sec]. This tolerates
     model drift past the clip end without corrupting the schema.
+
+String-length clamping:
+    Every free-text field that is aggregated across segments (caption,
+    risk description) is clamped to its schema max at a sentence
+    boundary, then at word boundary, and only as a last resort mid-word.
+    A ``string_clamped`` structlog event fires on any truncation so the
+    overflow is discoverable.
 
 Defaults for missing sub-tasks:
     - No scene:      environment=all-unknown, scene_category=[], caption placeholder.
@@ -46,10 +60,13 @@ Split:
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
+import re
 from collections import OrderedDict
-from typing import Any
+from collections.abc import Callable
+from typing import Any, Protocol
 
 import structlog
 from sqlalchemy import select
@@ -83,8 +100,38 @@ from .schemas.enums import (
     Walkability,
     Weather,
 )
+from .schemas.subtasks import CaptionResponse
+from .tasks.base import run_text_subtask
+from .vlm.client import ChatMessage, VLMResponse
 
 _log = structlog.stdlib.get_logger(__name__)
+
+
+# Schema field maxima; keep in sync with schemas/annotation.py.
+_CAPTION_MAX_LEN = 700
+_RISK_DESCRIPTION_MAX_LEN = 300
+
+# Target the model at a slightly-shorter length so it aims below the cap
+# and leaves headroom for the safety clamp.
+_CAPTION_MERGE_TARGET_LEN = 600
+
+_MERGE_TASK = "caption_merge"
+
+
+class _MergeClient(Protocol):
+    """Minimum surface the merge call needs from a VLM client."""
+
+    async def chat(
+        self,
+        messages: list[ChatMessage],
+        *,
+        response_format_json: bool = ...,
+        max_output_tokens: int | None = ...,
+        temperature: float | None = ...,
+    ) -> VLMResponse: ...
+
+    async def aclose(self) -> None: ...
+
 
 _WALKABILITY_ORDER: dict[Walkability, int] = {
     Walkability.not_passable: 3,
@@ -100,17 +147,33 @@ _IMPORTANCE_ORDER: dict[Importance, int] = {
 }
 
 
+_MergeClientFactory = Callable[[], "_MergeClient"]
+
+
 class AssembleError(RuntimeError):
     """Raised when a video row is missing or the assembled dict fails
     final-schema validation."""
 
 
-def assemble_video(video_id: str, *, persist: bool = True) -> dict[str, Any]:
+def assemble_video(
+    video_id: str,
+    *,
+    persist: bool = True,
+    merge_client_factory: _MergeClientFactory | None = None,
+) -> dict[str, Any]:
     """Assemble the final annotation dict for one video.
 
     Returns the JSON-serialisable dict (already schema-validated). When
     ``persist`` is True, an ``Annotation`` row is upserted and the Video
     status advances to ``assembled``.
+
+    ``merge_client_factory`` is called once, ONLY when the video has
+    multiple segments AND no cached merge result exists. The factory
+    must return a fresh client bound to no other event loop; the merge
+    call runs inside its own :func:`asyncio.run` scope and closes the
+    client at the end. Pass ``None`` (default) to skip the model call
+    entirely — assembly falls back to a length-safe join. Never crashes
+    on caption length.
     """
     structlog.contextvars.bind_contextvars(video_id=video_id)
     try:
@@ -139,6 +202,7 @@ def assemble_video(video_id: str, *, persist: bool = True) -> dict[str, Any]:
             )
 
             per_seg: dict[int, dict[str, Any]] = {}
+            merged_caption_cached: str | None = None
             for row in task_rows:
                 if not row.parsed_json:
                     continue
@@ -151,12 +215,17 @@ def assemble_video(video_id: str, *, persist: bool = True) -> dict[str, Any]:
                         task=row.task_name,
                     )
                     continue
+                if row.task_name == _MERGE_TASK and row.segment_idx == -1:
+                    merged_caption_cached = str(parsed.get("caption") or "")
+                    continue
                 per_seg.setdefault(row.segment_idx, {})[row.task_name] = parsed
 
             annotation_dict = _build_annotation(
                 video=v,
                 segment_indices=[s.idx for s in segments],
                 per_seg=per_seg,
+                merge_client_factory=merge_client_factory,
+                cached_merged_caption=merged_caption_cached,
             )
 
             validated = FinalAnnotation.model_validate(annotation_dict)
@@ -205,11 +274,53 @@ def _clamp_span(start: float, end: float, duration: float) -> tuple[float, float
     return s, e
 
 
+_SENTENCE_END_RE = re.compile(r"[\.!\?]\s")
+
+
+def _clean_truncate(text: str, max_len: int) -> tuple[str, bool]:
+    """Truncate ``text`` to ``<=max_len`` chars at the cleanest boundary.
+
+    Prefer a sentence boundary (``.``/``!``/``?`` + whitespace); fall back
+    to a word boundary; last resort is a hard slice. Trailing whitespace
+    is stripped. Returns ``(text, truncated)``.
+    """
+    if len(text) <= max_len:
+        return text, False
+
+    window = text[:max_len]
+    best_end = -1
+    for m in _SENTENCE_END_RE.finditer(window):
+        best_end = m.end()
+    if best_end > max_len // 2:
+        return window[:best_end].rstrip(), True
+
+    space = window.rfind(" ")
+    if space > max_len // 2:
+        return window[:space].rstrip(), True
+
+    return window.rstrip(), True
+
+
+def _clamp_text(text: str, max_len: int, *, field: str) -> str:
+    clamped, truncated = _clean_truncate(text, max_len)
+    if truncated:
+        _log.warning(
+            "string_clamped",
+            field=field,
+            max_len=max_len,
+            original_len=len(text),
+            clamped_len=len(clamped),
+        )
+    return clamped
+
+
 def _build_annotation(
     *,
     video: Video,
     segment_indices: list[int],
     per_seg: dict[int, dict[str, Any]],
+    merge_client_factory: _MergeClientFactory | None = None,
+    cached_merged_caption: str | None = None,
 ) -> dict[str, Any]:
     settings = get_settings()
     duration = float(video.duration_sec)
@@ -218,15 +329,20 @@ def _build_annotation(
     scene_env, scene_tags = _aggregate_scene(per_seg, segment_indices)
 
     # ------------------------------------------------- caption
-    caption_text = _aggregate_caption(per_seg, segment_indices)
+    per_seg_captions = _collect_segment_captions(per_seg, segment_indices)
+    caption_text = _resolve_caption(
+        video_id=video.id,
+        per_seg_captions=per_seg_captions,
+        per_seg=per_seg,
+        segment_indices=segment_indices,
+        merge_client_factory=merge_client_factory,
+        cached=cached_merged_caption,
+    )
+    # Belt-and-suspenders: no matter where the caption came from, respect
+    # the schema max. Assembly must never crash on caption length.
+    caption_text = _clamp_text(caption_text, _CAPTION_MAX_LEN, field="caption")
     if not caption_text:
-        for idx in segment_indices:
-            scene_raw = per_seg.get(idx, {}).get("scene")
-            if scene_raw and scene_raw.get("scene_summary"):
-                caption_text = str(scene_raw["scene_summary"]).strip()
-                break
-        if not caption_text:
-            caption_text = "First-person navigation view."
+        caption_text = "First-person navigation view."
 
     # ------------------------------------------------- key_elements
     key_elements = _aggregate_entities(per_seg, segment_indices, duration)
@@ -315,13 +431,144 @@ def _aggregate_scene(
     return default_env, []
 
 
-def _aggregate_caption(per_seg: dict[int, dict[str, Any]], indices: list[int]) -> str:
-    parts: list[str] = []
+def _collect_segment_captions(
+    per_seg: dict[int, dict[str, Any]], indices: list[int]
+) -> list[tuple[int, str]]:
+    """Return the non-empty caption for each segment, in order."""
+    out: list[tuple[int, str]] = []
     for idx in indices:
         cap = per_seg.get(idx, {}).get("caption")
         if cap and cap.get("caption"):
-            parts.append(str(cap["caption"]).strip())
+            out.append((idx, str(cap["caption"]).strip()))
+    return out
+
+
+def _collect_scene_summaries(
+    per_seg: dict[int, dict[str, Any]], indices: list[int]
+) -> list[str]:
+    out: list[str] = []
+    for idx in indices:
+        scene = per_seg.get(idx, {}).get("scene")
+        if scene and scene.get("scene_summary"):
+            out.append(str(scene["scene_summary"]).strip())
+    return out
+
+
+def _resolve_caption(
+    *,
+    video_id: str,
+    per_seg_captions: list[tuple[int, str]],
+    per_seg: dict[int, dict[str, Any]],
+    segment_indices: list[int],
+    merge_client_factory: _MergeClientFactory | None,
+    cached: str | None,
+) -> str:
+    """Pick or synthesise the final caption for the video."""
+    if not per_seg_captions:
+        for idx in segment_indices:
+            scene_raw = per_seg.get(idx, {}).get("scene")
+            if scene_raw and scene_raw.get("scene_summary"):
+                return str(scene_raw["scene_summary"]).strip()
+        return ""
+
+    if len(per_seg_captions) == 1:
+        return per_seg_captions[0][1]
+
+    if cached:
+        return cached
+
+    if merge_client_factory is not None:
+        merged = _merge_captions_via_model(
+            video_id=video_id,
+            per_seg_captions=per_seg_captions,
+            scene_summaries=_collect_scene_summaries(per_seg, segment_indices),
+            factory=merge_client_factory,
+        )
+        if merged:
+            return merged
+
+    return _length_safe_join([c for _, c in per_seg_captions])
+
+
+def _length_safe_join(parts: list[str]) -> str:
+    """Fallback merge when no model is available.
+
+    Joins by ``"; "`` and lets the caller clamp; documented for its
+    predictability under crash conditions.
+    """
     return "; ".join(parts).strip()
+
+
+def _merge_captions_via_model(
+    *,
+    video_id: str,
+    per_seg_captions: list[tuple[int, str]],
+    scene_summaries: list[str],
+    factory: _MergeClientFactory,
+) -> str:
+    """Issue one text-only synthesis call to summarise per-segment captions.
+
+    A fresh client is instantiated INSIDE the coroutine that runs on a
+    dedicated event loop, so no httpx state is shared across
+    ``asyncio.run`` boundaries. The result is persisted as a TaskResult
+    row keyed by ``(video_id, segment_idx=-1, task_name="caption_merge")``
+    so repeated ``assemble`` invocations do not re-hit the model.
+    """
+    context = {
+        "target_max_chars": _CAPTION_MERGE_TARGET_LEN,
+        "scene_summaries": scene_summaries[:8],
+        "segment_captions": [
+            {"segment_idx": idx, "caption": text} for idx, text in per_seg_captions
+        ],
+    }
+    context_json = json.dumps(context, ensure_ascii=False)
+
+    async def _run() -> tuple[Any, bool]:
+        client = factory()
+        try:
+            return await run_text_subtask(
+                client=client,
+                task_name=_MERGE_TASK,
+                response_model=CaptionResponse,
+                context_json=context_json,
+                video_id=video_id,
+                segment_idx=-1,
+                max_output_tokens=None,
+            )
+        finally:
+            await client.aclose()
+
+    try:
+        validated, ok = _run_sync(_run)
+    except Exception as exc:
+        _log.warning("caption_merge_call_failed", err=repr(exc))
+        return ""
+
+    if not ok or validated is None:
+        return ""
+    return str(validated.caption).strip()
+
+
+def _run_sync(coro_factory: Any) -> Any:
+    """Run an async coroutine from sync code.
+
+    ``assemble_video`` is synchronous (called from the CLI + tests). If
+    we are not inside a running loop, ``asyncio.run`` is enough. If we
+    ARE inside a loop (e.g. ``run --all``), we hand the coroutine to a
+    worker thread with its own loop.
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro_factory())
+
+    import concurrent.futures
+
+    def _worker() -> Any:
+        return asyncio.new_event_loop().run_until_complete(coro_factory())
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+        return ex.submit(_worker).result()
 
 
 def _aggregate_entities(
@@ -375,11 +622,13 @@ def _aggregate_risks(
             start = float(r.get("start_sec") or 0.0)
             end = float(r.get("end_sec") or start)
             start, end = _clamp_span(start, end, duration)
+            raw_desc = str(r.get("description") or "").strip() or "No description."
+            desc = _clamp_text(raw_desc, _RISK_DESCRIPTION_MAX_LEN, field="risk.description")
             item = {
                 "type": _coerce_enum(r.get("risk_type"), RiskType).value,
                 "severity": _coerce_enum(r.get("severity"), Severity).value,
                 "time_span": [start, end],
-                "description": str(r.get("description") or "").strip() or "No description.",
+                "description": desc,
             }
             out.append(RiskLabel.model_validate(item).model_dump(mode="json"))
             if len(out) >= 8:
@@ -444,7 +693,9 @@ def _aggregate_qa(
                 "question": str(item.get("question") or "").strip(),
                 "answer": str(item.get("answer") or "").strip(),
                 "evidence_elements": [
-                    str(x).strip() for x in (item.get("evidence_entities") or []) if str(x).strip()
+                    str(x).strip()
+                    for x in (item.get("evidence_entities") or [])
+                    if str(x).strip()
                 ][:8],
                 "evidence_time_span": time_span,
                 "answer_type": _coerce_enum(item.get("answer_type"), AnswerType).value,
@@ -478,4 +729,10 @@ def _coerce_split(value: str) -> Split:
     return member
 
 
-__all__ = ["AssembleError", "assemble_video"]
+__all__ = ["AssembleError", "MergeClient", "MergeClientFactory", "assemble_video"]
+
+
+# Public aliases so callers (CLI, tests) can annotate factory types without
+# importing the private-underscored symbols.
+MergeClient = _MergeClient
+MergeClientFactory = _MergeClientFactory

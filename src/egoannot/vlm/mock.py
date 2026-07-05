@@ -135,6 +135,13 @@ _CANNED: dict[str, dict[str, Any]] = {
         "viewpoint": "eye_level_walking",
         "reason": "Forward-facing eye-level walking viewpoint with visible activity.",
     },
+    "caption_merge": {
+        "caption": (
+            "I walk through a mixed indoor and outdoor route, passing pedestrians "
+            "and parked cars, slowing down where the path narrows and observing "
+            "signs overhead. Overall the walk is passable with occasional caution."
+        )
+    },
 }
 
 

@@ -15,6 +15,7 @@ import asyncio
 import json
 import uuid
 from pathlib import Path
+from typing import cast
 
 import structlog
 import typer
@@ -22,7 +23,7 @@ from rich.console import Console
 from rich.table import Table
 from sqlalchemy import func, select
 
-from .assemble import AssembleError, assemble_video
+from .assemble import AssembleError, MergeClient, MergeClientFactory, assemble_video
 from .config import get_settings
 from .curate import curate_all
 from .db import Segment, Video, init_engine, session_scope
@@ -63,6 +64,20 @@ def _boot(log_level: str | None = None) -> None:
 
 def _make_client(use_mock: bool):  # type: ignore[no-untyped-def]
     return MockVLMClient() if use_mock else VLMClient()
+
+
+def _make_factory(use_mock: bool) -> MergeClientFactory:
+    """Return a fresh-client factory whose static type widens to the
+    ``MergeClient`` protocol; both concrete clients structurally match it.
+    """
+    if use_mock:
+        def _mock_factory() -> MergeClient:
+            return MockVLMClient()
+        return _mock_factory
+
+    def _real_factory() -> MergeClient:
+        return VLMClient()
+    return _real_factory
 
 
 # --------------------------------------------------------------------- ingest
@@ -228,6 +243,11 @@ def annotate(
 def assemble(
     video_id: str | None = typer.Option(None, "--video-id"),
     all_: bool = typer.Option(False, "--all"),
+    mock: bool = typer.Option(
+        False,
+        "--mock",
+        help="Use MockVLMClient for the multi-segment caption-merge call.",
+    ),
     log_level: str | None = typer.Option(None, "--log-level"),
 ) -> None:
     """Assemble final annotations from validated sub-task rows."""
@@ -236,9 +256,12 @@ def assemble(
     if not ids:
         console.print("[yellow]assemble[/yellow]: no matching videos.")
         return
+    # A fresh client is created per merge call inside assemble_video.
+    # Single-segment videos never touch the factory.
+    factory = _make_factory(mock)
     for vid in ids:
         try:
-            payload = assemble_video(vid)
+            payload = assemble_video(vid, merge_client_factory=factory)
             console.print(
                 f"[green]assemble[/green] {vid}: qa={len(payload['qa_pairs'])} "
                 f"key_elements={len(payload['key_elements'])} "
@@ -305,11 +328,13 @@ def run_all(
 
     asyncio.run(_pipeline())
 
-    # assemble + export (sync)
+    # assemble + export (sync). Multi-segment videos will spin up a
+    # short-lived merge client per video; single-segment videos skip it.
+    factory = _make_factory(mock)
     ids = _resolve_ids(None, True, require_status_at_least="tasks_done")
     for vid in ids:
         try:
-            assemble_video(vid)
+            assemble_video(vid, merge_client_factory=factory)
         except AssembleError as e:
             console.print(f"[red]assemble FAIL[/red] {vid}: {e}")
     export_all(jsonl=jsonl)

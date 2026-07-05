@@ -9,9 +9,18 @@ import pytest
 from egoannot.assemble import assemble_video
 from egoannot.db import Annotation, Segment, TaskResult, Video, session_scope
 from egoannot.schemas.annotation import FinalAnnotation
+from egoannot.vlm.mock import MockVLMClient
 
 
-def _mk_video(vid: str, *, duration: float = 30.0, dataset: str = "jaad") -> None:
+def _mk_video(
+    vid: str,
+    *,
+    duration: float = 30.0,
+    dataset: str = "jaad",
+    num_segments: int = 1,
+    num_candidate_frames: int | None = None,
+) -> None:
+    ncf = num_candidate_frames if num_candidate_frames is not None else 12 * num_segments
     with session_scope() as s:
         s.add(
             Video(
@@ -23,20 +32,29 @@ def _mk_video(vid: str, *, duration: float = 30.0, dataset: str = "jaad") -> Non
                 fps=30.0,
                 resolution_w=640,
                 resolution_h=480,
-                num_candidate_frames=12,
-                candidate_fps=12 / duration,
+                num_candidate_frames=ncf,
+                candidate_fps=ncf / duration,
                 status="tasks_done",
             )
         )
-        s.add(Segment(video_id=vid, idx=0, start_sec=0.0, end_sec=duration))
+        seg_len = duration / num_segments
+        for i in range(num_segments):
+            s.add(
+                Segment(
+                    video_id=vid,
+                    idx=i,
+                    start_sec=i * seg_len,
+                    end_sec=(i + 1) * seg_len,
+                )
+            )
 
 
-def _mk_task(vid: str, task: str, payload: dict) -> None:
+def _mk_task(vid: str, task: str, payload: dict, segment_idx: int = 0) -> None:
     with session_scope() as s:
         s.add(
             TaskResult(
                 video_id=vid,
-                segment_idx=0,
+                segment_idx=segment_idx,
                 task_name=task,
                 raw_response=json.dumps(payload),
                 parsed_json=json.dumps(payload),
@@ -206,3 +224,144 @@ def test_assemble_missing_video_raises(tmp_pipeline):
     from egoannot.assemble import AssembleError
     with pytest.raises(AssembleError):
         assemble_video("VID_999999")
+
+
+# --------------------------------------------------- multi-segment captions
+
+
+_LONG_SEG_CAPTION = (
+    "The walker moves ahead in this segment, notices pedestrians on both "
+    "sides, and adjusts speed accordingly to avoid contact while continuing "
+    "to observe the surroundings for further changes in the environment."
+)
+
+
+def _seed_multi_segment_video(vid: str, *, num_segments: int) -> None:
+    _mk_video(vid, duration=260.0, num_segments=num_segments)
+    for i in range(num_segments):
+        _mk_task(
+            vid,
+            "scene",
+            {
+                "location_type": "outdoor",
+                "scene_category": ["outdoor_walkway"],
+                "lighting": "normal",
+                "weather": "clear",
+                "crowd_level": "low",
+                "camera_motion": "walking",
+                "scene_summary": f"Segment {i}: walking a corridor.",
+            },
+            segment_idx=i,
+        )
+        _mk_task(vid, "caption", {"caption": _LONG_SEG_CAPTION}, segment_idx=i)
+
+
+class _CountingMockClient(MockVLMClient):
+    """MockVLMClient that counts calls per task, to prove merge invocation."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls: dict[str, int] = {}
+
+    async def chat(self, messages, **kwargs):  # type: ignore[override]
+        # Extract SUBTASK= marker to record the task name.
+        for m in messages:
+            if m.role == "system" and isinstance(m.content, str):
+                for line in m.content.splitlines():
+                    if line.startswith("SUBTASK="):
+                        name = line.split("=", 1)[1].strip()
+                        self.calls[name] = self.calls.get(name, 0) + 1
+                        break
+        return await super().chat(messages, **kwargs)
+
+
+def test_multi_segment_caption_stays_within_schema_limit(tmp_pipeline):
+    """13 segments (like VID_895826). Naive join would exceed 700 chars.
+
+    With a merge factory the merged caption fits AND the merge call is
+    invoked exactly once.
+    """
+    vid = "VID_000700"
+    _seed_multi_segment_video(vid, num_segments=13)
+
+    # Naive join length would exceed the schema max — sanity check.
+    naive = "; ".join([_LONG_SEG_CAPTION] * 13)
+    assert len(naive) > 700
+
+    counter = _CountingMockClient()
+    payload = assemble_video(vid, merge_client_factory=lambda: counter)
+    FinalAnnotation.model_validate(payload)  # schema-valid
+    assert len(payload["caption"]) <= 700
+    assert payload["caption"], "caption must not be empty"
+    # Merge call happened exactly once for this multi-segment video.
+    assert counter.calls.get("caption_merge", 0) == 1
+
+
+def test_multi_segment_without_client_falls_back_and_clamps(tmp_pipeline):
+    """No factory -> length-safe join + safety clamp; no crash."""
+    vid = "VID_000701"
+    _seed_multi_segment_video(vid, num_segments=13)
+
+    payload = assemble_video(vid, merge_client_factory=None)
+    FinalAnnotation.model_validate(payload)
+    # The clamp keeps caption within the schema max.
+    assert len(payload["caption"]) <= 700
+    # And produced a non-trivial caption (not the fallback placeholder).
+    assert payload["caption"] != "First-person navigation view."
+
+
+def test_merged_caption_is_cached_and_not_re_called(tmp_pipeline):
+    """Second assemble on the same video does not re-invoke the merge call."""
+    vid = "VID_000702"
+    _seed_multi_segment_video(vid, num_segments=5)
+
+    counter = _CountingMockClient()
+    _ = assemble_video(vid, merge_client_factory=lambda: counter)
+    calls_first = counter.calls.get("caption_merge", 0)
+    _ = assemble_video(vid, merge_client_factory=lambda: counter)
+    calls_second = counter.calls.get("caption_merge", 0)
+    assert calls_first == 1
+    assert calls_second == 1  # cached; no new call
+
+
+def test_clean_truncate_prefers_sentence_boundary():
+    from egoannot.assemble import _clean_truncate
+
+    text = "One sentence. Two sentence. Three sentence."
+    truncated, changed = _clean_truncate(text, max_len=20)
+    assert changed
+    # Must end at a sentence boundary that fits.
+    assert truncated.endswith(".")
+    assert len(truncated) <= 20
+
+
+def test_risk_description_is_clamped(tmp_pipeline):
+    """Overlong risk descriptions must be truncated, not fail validation."""
+    vid = "VID_000703"
+    _mk_video(vid, duration=30.0)
+    _mk_task(vid, "scene", {
+        "location_type": "outdoor",
+        "scene_category": [],
+        "lighting": "normal",
+        "weather": "clear",
+        "crowd_level": "low",
+        "camera_motion": "walking",
+        "scene_summary": "OK.",
+    })
+    long_desc = "Alert! " + ("Watch the path here. " * 40)  # >>300 chars
+    _mk_task(vid, "judgment", {
+        "walkability": "passable_with_caution",
+        "actions": ["observe"],
+        "risks": [{
+            "risk_type": "obstacle_ahead",
+            "severity": "medium",
+            "start_sec": 0.0,
+            "end_sec": 30.0,
+            "description": long_desc,
+            "related_entities": [],
+        }],
+        "confidence": 0.5,
+    })
+    payload = assemble_video(vid)
+    assert len(payload["risk_labels"]) == 1
+    assert len(payload["risk_labels"][0]["description"]) <= 300

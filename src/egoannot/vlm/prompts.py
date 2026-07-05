@@ -185,7 +185,29 @@ Cover as many distinct qa_type values as possible. Output JSON:
 """
 
 
-# --------------------------------------------------------------------------- curate
+# --------------------------------------------------------------------------- caption_merge
+_CAPTION_MERGE_INSTRUCTIONS = """SUBTASK=caption_merge
+You will be given the per-segment captions of a multi-segment egocentric
+walking video, plus (optionally) per-segment scene summaries. These are
+already validated JSON produced by earlier sub-tasks. Do NOT ask for
+images.
+
+Task: fold the per-segment captions into ONE coherent first-person
+English caption for the WHOLE video. Preserve the walker's chronology
+where the captions imply it (segment_idx is monotonically increasing).
+Do not enumerate segments; write natural prose. Keep the output
+strictly shorter than the ``target_max_chars`` value provided in the
+input context — aim for 2-4 sentences.
+
+Output JSON:
+{
+  "caption": "<2-4 English sentences summarising the whole walk>"
+}
+
+Return exactly ONE JSON object. No prose, no markdown fences.
+"""
+
+
 _CURATE_INSTRUCTIONS = """SUBTASK=curate
 You are inspecting a few sample frames from a candidate video for a dataset
 of egocentric (first-person, eye-level) walking/navigation clips.
@@ -210,6 +232,7 @@ _TASK_TEMPLATES: dict[str, str] = {
     "caption": _CAPTION_INSTRUCTIONS,
     "qa": _QA_INSTRUCTIONS,
     "curate": _CURATE_INSTRUCTIONS,
+    "caption_merge": _CAPTION_MERGE_INSTRUCTIONS,
 }
 
 
@@ -248,7 +271,7 @@ def build_messages(
             template = template.replace("{" + key + "}", str(val))
     system_msg = ChatMessage(role="system", content=template)
 
-    if task in {"caption", "qa"}:
+    if task in {"caption", "qa", "caption_merge"}:
         if not context_json:
             raise ValueError(f"task {task!r} requires context_json (prior sub-task outputs)")
         user_content = (
