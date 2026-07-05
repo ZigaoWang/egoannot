@@ -255,18 +255,52 @@ egoannot dashboard
 **This repository ships no data.** You must obtain each dataset yourself,
 under that dataset's own license.
 
-| Dataset  | Viewpoint       | Adapter status                                                 |
-| -------- | --------------- | -------------------------------------------------------------- |
-| JAAD     | dashcam         | Real adapter (`JAADAdapter`); reference implementation.        |
-| ADVIO    | walking (fits)  | Stub (`NotImplementedError`). Confirm on-disk layout, then implement. |
-| SCAND    | walking (fits)  | Stub. Confirm on-disk layout, then implement.                  |
-| NavWare  | walking         | Stub. Confirm on-disk layout, then implement.                  |
+| Dataset  | Viewpoint                    | License                                   | Adapter status                                        |
+| -------- | ---------------------------- | ----------------------------------------- | ----------------------------------------------------- |
+| JAAD     | dashcam                      | CC BY 4.0 (attribution)                   | Real adapter (`JAADAdapter`); reference implementation. |
+| ADVIO    | handheld walking egocentric  | **CC BY-NC 4.0 (non-commercial)**         | Real adapter (`ADVIOAdapter`); primary content fit.   |
+| SCAND    | walking egocentric           | see dataset terms                         | Stub (`NotImplementedError`). Confirm on-disk layout, then implement. |
+| NavWare  | walking egocentric           | see dataset terms                         | Stub. Confirm on-disk layout, then implement.         |
 
 **JAAD is dashcam-only** and is included as a reference adapter for
-plumbing the pipeline end-to-end. For a truly walking-egocentric dataset,
-ADVIO and SCAND are the better fit — plug in their adapters by cloning
-the `JAADAdapter` shape and registering in
-`egoannot.ingest.ADAPTERS`.
+plumbing the pipeline end-to-end. The walking-egocentric fits are
+**ADVIO** (real handheld iPhone footage across malls, metro stations,
+stairs, indoor and outdoor scenes — the primary content fit for this
+pipeline) plus SCAND and NavWare once their adapters are implemented.
+
+### ADVIO
+
+Download from Zenodo yourself. ADVIO is licensed under **CC BY-NC 4.0**
+— this is stricter than JAAD's plain CC-BY and forbids commercial use.
+Every downstream artefact derived from ADVIO inherits that restriction;
+make sure your use case is compatible before running the pipeline on it.
+
+Expected on-disk layout:
+
+```
+<advio-root>/
+    advio-01/
+        iphone/frames.mov      # RGB, narrow-FOV, walking POV — USED
+        iphone/frames.csv      # sensor sidecar — ignored
+        tango/frames.mov       # fisheye Tango stream — IGNORED (wrong FOV)
+        tango/frames.csv       # ignored
+        ...
+    advio-02/
+        ...
+```
+
+Only the `iphone/frames.mov` per recording is registered. The Tango
+fisheye stream is deliberately skipped: its FOV is wrong for this
+pipeline's downstream use. ADVIO ships no official train/val/test split,
+so the deterministic sha1 bucketing takes over (same as JAAD without
+`split_ids/`). Video ids are derived deterministically from the
+recording folder name (`advio-01` etc.) so re-ingesting the same root
+produces the same ids across runs.
+
+ADVIO recordings are minutes long, so most will exercise the
+multi-segment path in the assembler.
+
+### Adding a new dataset
 
 To adapt a new dataset, implement:
 
@@ -275,7 +309,9 @@ class DatasetAdapter(Protocol):
     def discover(self, root: Path) -> Iterator[DiscoveredVideo]: ...
 ```
 
-`DiscoveredVideo` carries `source_path` and optional `split_hint`.
+`DiscoveredVideo` carries `source_path`, an optional `dataset_key`
+(populate this to get deterministic VIDs across runs), and an optional
+`split_hint`.
 
 ## Reference annotation
 
