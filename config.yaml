@@ -51,6 +51,9 @@ frames:
   segment_max_sec: 45        # clips <= this become a single segment
   segment_len_sec: 20        # otherwise: non-overlapping segments of this length
   per_segment: 12            # frames sampled per segment for model calls
+  # Long-recording chunking (see SPEC.md).
+  chunk_long_videos: true
+  chunk_sec: 40.0
 
 tasks:
   max_entities: 8

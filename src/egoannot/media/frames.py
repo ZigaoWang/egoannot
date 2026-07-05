@@ -135,8 +135,17 @@ def extract_frames(
     fps: int | None = None,
     max_long_side: int | None = None,
     jpeg_quality: int | None = None,
+    start_sec: float | None = None,
+    end_sec: float | None = None,
 ) -> list[Path]:
     """Extract candidate frames at ``fps`` into ``frame_dir``, downscaling.
+
+    When ``start_sec`` / ``end_sec`` are given, only that window of the
+    source is extracted (ffmpeg ``-ss`` / ``-to``). This is how chunked
+    videos read their slice of the parent recording. Timestamps written
+    into filenames are CHUNK-RELATIVE (t=0 at ``start_sec``), so
+    downstream sampling/segmentation stays consistent whether or not
+    chunking is in use.
 
     Idempotent: if ``frame_dir`` already contains at least one frame, this
     function is a no-op and returns the sorted existing list. Callers who
@@ -151,7 +160,10 @@ def extract_frames(
     existing = sorted(frame_dir.glob("f_*.jpg"))
     if existing:
         _log.info(
-            "frames_reused", video=str(video_path), count=len(existing), frame_dir=str(frame_dir)
+            "frames_reused",
+            video=str(video_path),
+            count=len(existing),
+            frame_dir=str(frame_dir),
         )
         return existing
 
@@ -163,15 +175,30 @@ def extract_frames(
     vf = ",".join(filters)
 
     out_pattern = frame_dir / "f_%05d.jpg"
-    cmd = [
-        ffmpeg,
-        "-y",
-        "-loglevel", "error",
-        "-i", str(video_path),
-        "-vf", vf,
-        "-q:v", str(_pil_to_ffmpeg_quality(jpeg_quality)),
+    cmd: list[str] = [ffmpeg, "-y", "-loglevel", "error"]
+    # ``-ss`` before ``-i`` = fast seek (keyframe accurate enough for our
+    # sampling density); ``-to`` after ``-i`` is an absolute source time.
+    if start_sec is not None and start_sec > 0:
+        cmd += ["-ss", f"{start_sec:.3f}"]
+    cmd += ["-i", str(video_path)]
+    if end_sec is not None and end_sec > 0:
+        # When we seek with -ss first, -t (duration) is the correct
+        # relative bound. Using -to would apply to output timeline too,
+        # but ffmpeg treats it relative to the seek point when -ss is
+        # before -i, so equivalent. Use -t for clarity.
+        if start_sec is not None and start_sec > 0:
+            duration = max(0.0, end_sec - start_sec)
+            cmd += ["-t", f"{duration:.3f}"]
+        else:
+            cmd += ["-to", f"{end_sec:.3f}"]
+    cmd += [
+        "-vf",
+        vf,
+        "-q:v",
+        str(_pil_to_ffmpeg_quality(jpeg_quality)),
         str(out_pattern),
     ]
+
     proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
     if proc.returncode != 0:
         raise FrameExtractionError(f"ffmpeg failed on {video_path}: {proc.stderr.strip()}")
@@ -194,6 +221,43 @@ def _pil_to_ffmpeg_quality(pil_quality: int) -> int:
     """
     pil_quality = max(1, min(100, pil_quality))
     return max(2, min(31, round(31 - (pil_quality * 0.29))))
+
+
+def plan_chunks(
+    duration_sec: float,
+    *,
+    chunk_sec: float | None = None,
+    enabled: bool | None = None,
+) -> list[tuple[float, float]]:
+    """Split ``duration_sec`` into consecutive ``[start, end)`` chunks.
+
+    Semantics:
+        - ``duration_sec <= 0``  -> [].
+        - ``enabled`` is False   -> [(0, duration_sec)] (no chunking).
+        - ``duration_sec <= chunk_sec`` -> [(0, duration_sec)] (single).
+        - otherwise              -> ceil(duration/chunk_sec) chunks;
+                                     last chunk may be shorter than
+                                     ``chunk_sec`` but never zero.
+
+    Called at ingest time so each chunk becomes its own Video row
+    downstream (see :mod:`egoannot.ingest`).
+    """
+    settings = get_settings()
+    chunk_sec = chunk_sec if chunk_sec is not None else settings.frames.chunk_sec
+    enabled = enabled if enabled is not None else settings.frames.chunk_long_videos
+
+    if duration_sec <= 0:
+        return []
+    if not enabled or duration_sec <= chunk_sec:
+        return [(0.0, duration_sec)]
+
+    out: list[tuple[float, float]] = []
+    start = 0.0
+    while start < duration_sec:
+        end = min(start + chunk_sec, duration_sec)
+        out.append((start, end))
+        start = end
+    return out
 
 
 def segment_video(
@@ -327,6 +391,7 @@ __all__ = [
     "VideoMeta",
     "encode_data_uri",
     "extract_frames",
+    "plan_chunks",
     "probe_video",
     "sample_segment_frames",
     "sampled_frames_to_content",

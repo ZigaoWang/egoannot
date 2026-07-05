@@ -15,7 +15,6 @@ import asyncio
 import json
 import uuid
 from pathlib import Path
-from typing import cast
 
 import structlog
 import typer
@@ -151,23 +150,35 @@ def frames(
             if v is None:
                 continue
             source = Path(v.source_path)
+            chunk_start = float(v.chunk_start_sec or 0.0)
+            chunk_end = float(v.chunk_end_sec or 0.0)
         try:
             meta = probe_video(source)
+            is_chunk = chunk_end > 0.0 and chunk_end > chunk_start
+            effective_duration = (chunk_end - chunk_start) if is_chunk else meta.duration_sec
             frame_dir = settings.paths.frames_dir / vid
-            frames_paths = extract_frames(source, frame_dir, meta)
-            segs = segment_video(meta.duration_sec)
+            frames_paths = extract_frames(
+                source,
+                frame_dir,
+                meta,
+                start_sec=chunk_start if is_chunk else None,
+                end_sec=chunk_end if is_chunk else None,
+            )
+            segs = segment_video(effective_duration)
             with session_scope() as session:
                 v = session.get(Video, vid)
                 if v is None:
                     continue
-                v.duration_sec = meta.duration_sec
+                v.duration_sec = effective_duration
                 v.fps = meta.fps
                 v.resolution_w = meta.width
                 v.resolution_h = meta.height
                 v.frame_dir = str(frame_dir)
                 total = settings.frames.per_segment * len(segs)
                 v.num_candidate_frames = total
-                v.candidate_fps = total / meta.duration_sec if meta.duration_sec > 0 else 0.0
+                v.candidate_fps = (
+                    total / effective_duration if effective_duration > 0 else 0.0
+                )
                 # Replace segments in place.
                 existing = session.execute(
                     select(Segment).where(Segment.video_id == vid)

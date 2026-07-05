@@ -106,6 +106,12 @@ class FramesSettings(BaseModel):
     segment_max_sec: float = 45.0
     segment_len_sec: float = 20.0
     per_segment: int = 12
+    # Long-recording chunking. Recordings longer than ``chunk_sec`` are
+    # split at ingest into N consecutive chunks, each becoming its own
+    # Video row. Keeps most clips single-segment (chunk_sec <
+    # segment_max_sec), avoiding cross-segment merge noise.
+    chunk_long_videos: bool = True
+    chunk_sec: float = 40.0
 
 
 class TasksSettings(BaseModel):

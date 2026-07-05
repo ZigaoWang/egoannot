@@ -107,21 +107,31 @@ def _metadata_pass(*, force: bool) -> list[str]:
         if not force:
             stmt = stmt.where(Video.status == "pending")
         rows = session.execute(stmt).scalars().all()
-        candidate_ids = [(r.id, r.source_path) for r in rows]
+        # Snapshot chunk fields too; chunk rows evaluate the chunk window
+        # against min/max_sec, not the parent recording.
+        candidate_ids = [
+            (r.id, r.source_path, float(r.chunk_start_sec or 0.0), float(r.chunk_end_sec or 0.0))
+            for r in rows
+        ]
 
     survivors: list[str] = []
-    for vid, src in candidate_ids:
+    for vid, src, chunk_start, chunk_end in candidate_ids:
         source = Path(src)
         try:
             meta = probe_video(source)
         except FrameExtractionError as e:
             _reject(vid, f"metadata_ffprobe: {e}")
             continue
-        if meta.duration_sec < min_sec:
-            _reject(vid, f"duration<{min_sec}s ({meta.duration_sec:.2f})")
+        effective_duration = (
+            chunk_end - chunk_start
+            if chunk_end > 0.0 and chunk_end > chunk_start
+            else meta.duration_sec
+        )
+        if effective_duration < min_sec:
+            _reject(vid, f"duration<{min_sec}s ({effective_duration:.2f})")
             continue
-        if meta.duration_sec > max_sec:
-            _reject(vid, f"duration>{max_sec}s ({meta.duration_sec:.2f})")
+        if effective_duration > max_sec:
+            _reject(vid, f"duration>{max_sec}s ({effective_duration:.2f})")
             continue
         if min(meta.width, meta.height) < 240:
             _reject(vid, f"resolution_too_small ({meta.width}x{meta.height})")
@@ -130,7 +140,7 @@ def _metadata_pass(*, force: bool) -> list[str]:
             v = session.get(Video, vid)
             if v is None:
                 continue
-            v.duration_sec = meta.duration_sec
+            v.duration_sec = effective_duration
             v.fps = meta.fps
             v.resolution_w = meta.width
             v.resolution_h = meta.height

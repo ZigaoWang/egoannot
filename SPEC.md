@@ -113,6 +113,42 @@ logs the coercion; it does not fail the video.
 5. For model calls, re-encode frames as base64 JPEG data URIs at
    `frames.jpeg_quality` (default 80). Precede each with a `[t=X.Xs]` text marker.
 
+## Long-recording chunking
+
+Recordings longer than `frames.chunk_sec` (default 40) are split AT
+INGEST TIME into consecutive `[start, end)` chunks. Each chunk is
+registered as its own `Video` row with `chunk_start_sec` /
+`chunk_end_sec` fields; siblings share `source_path`. Chunk ids derive
+deterministically from `<parent_dataset_key>#c<idx:03d>`.
+
+Rationale for ingest-time (not frames-time) chunking:
+- Downstream stages (curate, frames, annotate, assemble, export) see
+  each chunk as an ordinary short clip. No cross-stage awareness needed.
+- Frame extraction seeks the chunk window directly via ffmpeg
+  `-ss` / `-t`; the discarded portion of the source is never decoded.
+- Extracted frames are CHUNK-RELATIVE (t=0 at chunk start). Every
+  segment boundary and `time_span` in the assembled annotation is
+  relative to the chunk, so semantics stay self-consistent per file.
+- Most 40s chunks fall under `frames.segment_max_sec=45`, keeping them
+  single-segment and avoiding the cross-segment caption-merge path.
+
+Toggle with `frames.chunk_long_videos` (default true).
+
+## QA temporal-phrasing policy
+
+The vision model is instructed NOT to write bare second numbers in the
+human-readable `question` or `answer` strings (e.g. "between 8.8 and
+16.2 seconds"). Frame sampling is sparse (~1–2 s spacing), so
+exact-second phrasing implies false precision. Model must use relative
+temporal language instead: "early in the clip", "as the escalator comes
+into view", "shortly after", "midway through", "near the end".
+
+The numeric `evidence_start_sec` / `evidence_end_sec` fields are for
+machine use and remain unchanged. The policy applies only to the
+free-text `question` and `answer` strings.
+
+Same principle applies to `event.description` and entity labels.
+
 ## Sub-tasks
 Each returns a strict Pydantic-validated JSON object. Prompts instruct the model
 (in English) to return only one JSON object with no prose and no markdown fences.

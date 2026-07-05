@@ -258,9 +258,11 @@ under that dataset's own license.
 | Dataset  | Viewpoint                    | License                                   | Adapter status                                        |
 | -------- | ---------------------------- | ----------------------------------------- | ----------------------------------------------------- |
 | JAAD     | dashcam                      | CC BY 4.0 (attribution)                   | Real adapter (`JAADAdapter`); reference implementation. |
-| ADVIO    | handheld walking egocentric  | **CC BY-NC 4.0 (non-commercial)**         | Real adapter (`ADVIOAdapter`); primary content fit.   |
-| SCAND    | walking egocentric           | see dataset terms                         | Stub (`NotImplementedError`). Confirm on-disk layout, then implement. |
-| NavWare  | walking egocentric           | see dataset terms                         | Stub. Confirm on-disk layout, then implement.         |
+| ADVIO    | handheld walking egocentric  | **CC BY-NC 4.0 (non-commercial)**         | Real adapter (`ADVIOAdapter`).                        |
+| EgoBlind | blind-user egocentric        | **CC BY-NC-SA 4.0 (non-commercial, share-alike)** | Registered via `GenericVideoFolderAdapter`. |
+| SANPO    | walking egocentric           | see dataset terms                         | Register via `GenericVideoFolderAdapter` (glob).      |
+| SCAND    | walking egocentric           | see dataset terms                         | Stub (`NotImplementedError`). Bespoke layout — write a dedicated adapter. |
+| NavWare  | walking egocentric           | see dataset terms                         | Stub. Bespoke layout — write a dedicated adapter.     |
 
 **JAAD is dashcam-only** and is included as a reference adapter for
 plumbing the pipeline end-to-end. The walking-egocentric fits are
@@ -270,10 +272,9 @@ pipeline) plus SCAND and NavWare once their adapters are implemented.
 
 ### ADVIO
 
-Download from Zenodo yourself. ADVIO is licensed under **CC BY-NC 4.0**
-— this is stricter than JAAD's plain CC-BY and forbids commercial use.
-Every downstream artefact derived from ADVIO inherits that restriction;
-make sure your use case is compatible before running the pipeline on it.
+Download from Zenodo yourself. Licensed **CC BY-NC 4.0** —
+non-commercial only, stricter than JAAD's plain CC-BY. Downstream
+artefacts inherit the restriction.
 
 Expected on-disk layout:
 
@@ -285,33 +286,60 @@ Expected on-disk layout:
         tango/frames.mov       # fisheye Tango stream — IGNORED (wrong FOV)
         tango/frames.csv       # ignored
         ...
-    advio-02/
-        ...
 ```
 
-Only the `iphone/frames.mov` per recording is registered. The Tango
-fisheye stream is deliberately skipped: its FOV is wrong for this
-pipeline's downstream use. ADVIO ships no official train/val/test split,
-so the deterministic sha1 bucketing takes over (same as JAAD without
-`split_ids/`). Video ids are derived deterministically from the
-recording folder name (`advio-01` etc.) so re-ingesting the same root
-produces the same ids across runs.
+Only `iphone/frames.mov` per recording is registered; Tango fisheye and
+CSVs are hard-ignored. Video ids derive deterministically from
+`advio-NN`.
 
-ADVIO recordings are minutes long, so most will exercise the
-multi-segment path in the assembler.
+ADVIO recordings are minutes long, so they trigger the long-recording
+chunking below by default.
+
+### EgoBlind
+
+Real blind-user egocentric footage — the best content fit for this
+pipeline. Licensed **CC BY-NC-SA 4.0** (non-commercial, share-alike):
+non-commercial use only and every downstream artefact must be licensed
+under the same terms. Check compatibility before running.
+
+Download from the [official repository's Google Drive link](https://github.com/doc-doc/EgoBlind).
+The repo ships no data — obtain videos yourself.
+
+Expected on-disk layout: **any directory of `.mp4` files** (flat or
+nested). The `GenericVideoFolderAdapter` recurses via `**/*.mp4`, so
+after unzipping the archive to a folder just point `ingest` at it:
+
+```bash
+egoannot ingest --dataset egoblind --path /path/to/egoblind_videos
+```
+
+Video ids derive deterministically from `egoblind/<relative_path>`, so
+moving the corpus root does not change ids.
 
 ### Adding a new dataset
 
-To adapt a new dataset, implement:
+Two options depending on layout:
 
-```python
-class DatasetAdapter(Protocol):
-    def discover(self, root: Path) -> Iterator[DiscoveredVideo]: ...
-```
+- **Plain-video datasets** (a folder of `.mp4`, possibly nested):
+  register with `GenericVideoFolderAdapter(dataset_name="mydataset",
+  glob="**/*.mp4")`. No new code beyond registration.
+- **Bespoke layouts** (paired streams, sidecar files, per-clip folders):
+  implement `class DatasetAdapter(Protocol)` yielding
+  `DiscoveredVideo(source_path, dataset_key, split_hint)`.
 
-`DiscoveredVideo` carries `source_path`, an optional `dataset_key`
-(populate this to get deterministic VIDs across runs), and an optional
-`split_hint`.
+Register in `egoannot.ingest.ADAPTERS`.
+
+### Long-recording chunking
+
+Source recordings longer than `frames.chunk_sec` (default 40 s) are
+split at ingest into consecutive chunks. Each chunk becomes its own
+`Video` row with `chunk_start_sec` / `chunk_end_sec`; siblings share the
+source file. Frame extraction seeks the chunk window directly, so no
+copies are made. All timestamps and `time_span` values in the assembled
+annotation are chunk-relative (t=0 at the chunk start).
+
+Toggle with `frames.chunk_long_videos: false` if you want each
+recording annotated as a single (potentially multi-segment) video.
 
 ## Reference annotation
 

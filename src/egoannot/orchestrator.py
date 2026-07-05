@@ -103,7 +103,7 @@ async def annotate_video(
         if row_data is None:
             _log.error("annotate_video_not_found")
             return VideoStatus.failed.value
-        source_path, current_status, frame_dir_str = row_data
+        source_path, current_status, frame_dir_str, chunk_start, chunk_end = row_data
 
         already_done = current_status in {
             VideoStatus.tasks_done.value,
@@ -116,14 +116,27 @@ async def annotate_video(
         # Frame extraction path — mark failed and bail if this raises.
         try:
             meta = probe_video(Path(source_path))
+            # When the Video row is a chunk of a longer recording, extract
+            # only that window and treat its duration as the annotation's
+            # duration. ``chunk_end == 0`` means "no chunk, whole file".
+            is_chunk = chunk_end > 0.0 and chunk_end > chunk_start
+            effective_duration = (
+                (chunk_end - chunk_start) if is_chunk else meta.duration_sec
+            )
             frame_dir = Path(frame_dir_str) if frame_dir_str else _default_frame_dir(video_id)
-            frames = extract_frames(Path(source_path), frame_dir, meta)
+            frames = extract_frames(
+                Path(source_path),
+                frame_dir,
+                meta,
+                start_sec=chunk_start if is_chunk else None,
+                end_sec=chunk_end if is_chunk else None,
+            )
         except FrameExtractionError as e:
             _log.error("frame_extraction_failed", err=str(e))
             _set_status(video_id, VideoStatus.failed.value, error=f"frames: {e}")
             return VideoStatus.failed.value
 
-        media_segs = segment_video(meta.duration_sec)
+        media_segs = segment_video(effective_duration)
         if not media_segs:
             _set_status(video_id, VideoStatus.failed.value, error="no_segments")
             return VideoStatus.failed.value
@@ -131,6 +144,7 @@ async def annotate_video(
         _persist_video_metadata(
             video_id=video_id,
             meta=meta,
+            effective_duration=effective_duration,
             frame_dir=str(frame_dir),
             media_segs=media_segs,
             per_segment=settings.frames.per_segment,
@@ -308,12 +322,18 @@ async def _dispatch_text(
     raise ValueError(f"unknown text task: {name}")
 
 
-def _load_video_row(video_id: str) -> tuple[str, str, str] | None:
+def _load_video_row(video_id: str) -> tuple[str, str, str, float, float] | None:
     with session_scope() as session:
         v = session.get(Video, video_id)
         if v is None:
             return None
-        return v.source_path, v.status, v.frame_dir
+        return (
+            v.source_path,
+            v.status,
+            v.frame_dir,
+            float(v.chunk_start_sec or 0.0),
+            float(v.chunk_end_sec or 0.0),
+        )
 
 
 def _default_frame_dir(video_id: str) -> Path:
@@ -324,6 +344,7 @@ def _persist_video_metadata(
     *,
     video_id: str,
     meta: VideoMeta,
+    effective_duration: float,
     frame_dir: str,
     media_segs: list[MediaSegment],
     per_segment: int,
@@ -333,14 +354,18 @@ def _persist_video_metadata(
         v = session.get(Video, video_id)
         if v is None:
             return
-        v.duration_sec = meta.duration_sec
+        # ``duration_sec`` on the Video row is the EFFECTIVE annotation
+        # duration (chunk window for chunked rows, full file otherwise).
+        # Assembly emits every time_span relative to this, so keeping it
+        # in one place makes the semantics consistent end-to-end.
+        v.duration_sec = effective_duration
         v.fps = meta.fps
         v.resolution_w = meta.width
         v.resolution_h = meta.height
         v.frame_dir = frame_dir
         v.num_candidate_frames = total_candidate
         v.candidate_fps = (
-            total_candidate / meta.duration_sec if meta.duration_sec > 0 else 0.0
+            total_candidate / effective_duration if effective_duration > 0 else 0.0
         )
 
         # Replace segments in place (idempotent).

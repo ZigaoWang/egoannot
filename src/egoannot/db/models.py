@@ -69,6 +69,14 @@ class Video(Base):
     # (per_segment * num_segments). NOT the raw 10-fps extraction count.
     num_candidate_frames: Mapped[int] = mapped_column(Integer, default=0)
 
+    # Long-recording chunking (see SPEC.md). When the source recording is
+    # longer than frames.chunk_sec, ingest splits it into N consecutive
+    # chunks; each chunk becomes its own Video row, sharing ``source_path``
+    # with its siblings but carrying its own [chunk_start_sec, chunk_end_sec)
+    # window. Both zero means "no chunk, use the whole file".
+    chunk_start_sec: Mapped[float] = mapped_column(Float, default=0.0)
+    chunk_end_sec: Mapped[float] = mapped_column(Float, default=0.0)
+
     status: Mapped[str] = mapped_column(String(16), default="pending", index=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
 

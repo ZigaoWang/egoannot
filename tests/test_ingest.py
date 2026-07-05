@@ -2,10 +2,16 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 from egoannot.db import Video, session_scope
-from egoannot.ingest import ADVIOAdapter, JAADAdapter, ingest_dataset
+from egoannot.ingest import (
+    ADVIOAdapter,
+    GenericVideoFolderAdapter,
+    JAADAdapter,
+    ingest_dataset,
+)
 
 
 def _touch(p: Path, size: int = 16) -> Path:
@@ -101,10 +107,22 @@ def test_advio_missing_root_yields_nothing(tmp_path: Path) -> None:
 # ---------- ingest_dataset determinism ---------------------------------
 
 
-def test_advio_ingest_ids_are_deterministic(tmp_path: Path, tmp_pipeline) -> None:
+def test_advio_ingest_ids_are_deterministic(
+    tmp_path: Path, tmp_pipeline, monkeypatch
+) -> None:
     root = tmp_path / "advio"
     for n in (1, 2, 3):
         _touch(root / f"advio-{n:02d}" / "iphone" / "frames.mov")
+
+    # Bypass ffprobe: the "videos" here are zero-byte stubs. Return a
+    # short synthetic duration so chunking keeps everything single-chunk.
+    from egoannot import ingest as ingest_mod
+    from egoannot.media.frames import VideoMeta
+
+    def _fake_probe(_path: Path) -> VideoMeta:
+        return VideoMeta(duration_sec=20.0, fps=30.0, width=640, height=480)
+
+    monkeypatch.setattr(ingest_mod, "probe_video", _fake_probe)
 
     inserted_first = ingest_dataset("advio", root)
     assert inserted_first == 3
@@ -125,7 +143,90 @@ def test_advio_ingest_ids_are_deterministic(tmp_path: Path, tmp_pipeline) -> Non
 
     assert first_ids == second_ids
     # All ids match the strict VID_\d{6} shape (needed downstream).
-    import re
-
     for vid in first_ids:
         assert re.match(r"^VID_\d{6}$", vid), vid
+
+
+def test_advio_ingest_chunks_long_recording(
+    tmp_path: Path, tmp_pipeline, monkeypatch
+) -> None:
+    """A 260s ADVIO clip splits into 7 chunks; ids are chunk-specific."""
+    root = tmp_path / "advio"
+    _touch(root / "advio-01" / "iphone" / "frames.mov")
+
+    from egoannot import ingest as ingest_mod
+    from egoannot.media.frames import VideoMeta
+
+    def _fake_probe(_path: Path) -> VideoMeta:
+        return VideoMeta(duration_sec=260.0, fps=30.0, width=1920, height=1080)
+
+    monkeypatch.setattr(ingest_mod, "probe_video", _fake_probe)
+
+    inserted = ingest_dataset("advio", root)
+    assert inserted == 7
+    with session_scope() as s:
+        rows = s.execute(
+            Video.__table__.select().order_by(Video.chunk_start_sec)
+        ).all()
+        windows = [(r.chunk_start_sec, r.chunk_end_sec) for r in rows]
+    assert windows == [
+        (0.0, 40.0),
+        (40.0, 80.0),
+        (80.0, 120.0),
+        (120.0, 160.0),
+        (160.0, 200.0),
+        (200.0, 240.0),
+        (240.0, 260.0),
+    ]
+    # Every chunk has a unique deterministic id.
+    assert len({r[0] for r in windows}) == 7
+
+
+
+# ---------- Generic video folder adapter -------------------------------
+
+
+def test_generic_adapter_picks_videos_from_nested_tree(tmp_path: Path) -> None:
+    root = tmp_path / "corpus"
+    _touch(root / "top.mp4")
+    _touch(root / "day1" / "clip_a.mp4")
+    _touch(root / "day1" / "clip_b.mp4")
+    _touch(root / "day2" / "session_1" / "video.mp4")
+    # Decoys — must be ignored.
+    _touch(root / "day1" / "notes.txt")
+    _touch(root / "day1" / "thumb.jpg")
+    _touch(root / "annotations.csv")
+    _touch(root / "day2" / "session_1" / "capture.log")
+
+    adapter = GenericVideoFolderAdapter(dataset_name="egoblind", glob="**/*.mp4")
+    found = list(adapter.discover(root))
+    paths = sorted(d.source_path.name for d in found)
+    assert paths == ["clip_a.mp4", "clip_b.mp4", "top.mp4", "video.mp4"]
+
+    keys = sorted(d.dataset_key for d in found)
+    assert keys == [
+        "egoblind/day1/clip_a",
+        "egoblind/day1/clip_b",
+        "egoblind/day2/session_1/video",
+        "egoblind/top",
+    ]
+    for d in found:
+        assert d.source_path.suffix == ".mp4"
+        assert d.split_hint == ""
+
+
+def test_generic_adapter_missing_root_yields_nothing(tmp_path: Path) -> None:
+    adapter = GenericVideoFolderAdapter(dataset_name="egoblind")
+    assert list(adapter.discover(tmp_path / "nope")) == []
+
+
+def test_generic_adapter_deterministic_across_reruns(tmp_path: Path) -> None:
+    root = tmp_path / "egoblind_corpus"
+    _touch(root / "v_00001.mp4")
+    _touch(root / "v_00002.mp4")
+
+    adapter = GenericVideoFolderAdapter(dataset_name="egoblind")
+    first = [d.dataset_key for d in adapter.discover(root)]
+    second = [d.dataset_key for d in adapter.discover(root)]
+    assert first == second
+

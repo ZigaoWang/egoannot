@@ -251,6 +251,8 @@ class SourceDataset(_CoerceMixin):
     advio = "advio"
     scand = "scand"
     navware = "navware"
+    egoblind = "egoblind"
+    generic = "generic"
 
     @classmethod
     def _default(cls) -> SourceDataset:
