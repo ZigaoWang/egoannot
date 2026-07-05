@@ -1,0 +1,18 @@
+All Rights Reserved.
+
+Copyright (c) 2026 egoannot maintainers.
+
+The source code in this repository is proprietary. No license, express or
+implied, is granted for use, reproduction, modification, distribution, or
+sublicensing beyond what is explicitly agreed in writing with the
+copyright holder.
+
+This license covers ONLY the source code in this repository. Datasets
+(JAAD, ADVIO, SCAND, NavWare, and any other video corpora) are governed
+by their own licenses; you must obtain them separately and comply with
+their terms of use. Model weights (Qwen3-VL and any other served model)
+are governed by their own licenses; this repository does not redistribute
+them.
+
+Nothing in this notice creates a warranty. The code is provided "as is",
+without warranty of any kind, express or implied.

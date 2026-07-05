@@ -1,0 +1,65 @@
+# Default runtime configuration. Overridable via config.yaml overrides,
+# environment variables (EGOANNOT_*), or .env file. All natural-language
+# comments below are informational; no user-facing strings live here.
+
+paths:
+  # Defaults are relative to CWD for portability. In production, override
+  # (via this file, .env, or EGOANNOT_PATHS__* env vars) to point at a
+  # data volume with several GB free (raw videos + frames dominate).
+  root: .
+  data_dir: ./data
+  log_dir: ./logs
+  # Subdirs under data_dir (created on demand).
+  raw_subdir: raw
+  videos_subdir: videos
+  frames_subdir: frames
+  outputs_subdir: outputs
+  db_filename: pipeline.db
+
+vlm:
+  base_url: http://localhost:8000/v1
+  model: Qwen3-VL-32B-Instruct
+  api_key: EMPTY            # vLLM ignores the value but the SDK requires a non-empty header
+  timeout_sec: 120
+  max_retries: 2            # http-level retries; validation retry is separate (1)
+  temperature: 0.1
+  top_p: 0.9
+  # Guard against blowing the 16384-token ceiling with 12 frames + prompt.
+  max_output_tokens: 768
+
+runtime:
+  concurrency: 4
+  log_level: INFO
+  # Set true from CLI flag --no-risk to skip the judgment sub-task.
+  skip_risk: false
+  # Deterministic mock client for offline tests / smoke runs.
+  use_mock: false
+
+curate:
+  min_sec: 15.0
+  max_sec: 90.0
+  target_count: 500
+  metadata_pass_concurrency: 8
+  model_pass_concurrency: 4
+  # Frame count used only for the cheap keep/drop classification call.
+  classifier_frames: 3
+
+frames:
+  fps: 10                    # extraction fps (candidate frames)
+  max_long_side: 1280        # downscale so long side <= this many pixels
+  jpeg_quality: 80
+  segment_max_sec: 45        # clips <= this become a single segment
+  segment_len_sec: 20        # otherwise: non-overlapping segments of this length
+  per_segment: 12            # frames sampled per segment for model calls
+
+tasks:
+  max_entities: 8
+  max_events: 6
+  num_qa: 5
+
+privacy:
+  # Static per-dataset flags surfaced in the final annotation.
+  jaad:    { face_blurred: true,  plate_blurred: true,  contains_sensitive_info: false }
+  advio:   { face_blurred: false, plate_blurred: false, contains_sensitive_info: false }
+  scand:   { face_blurred: true,  plate_blurred: true,  contains_sensitive_info: false }
+  navware: { face_blurred: false, plate_blurred: false, contains_sensitive_info: false }
