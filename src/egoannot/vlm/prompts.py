@@ -87,9 +87,12 @@ Task: list the most navigation-relevant entities visible. Output JSON:
   ]
 }}
 
-Use the [t=Xs] markers to fill first_seen_sec / last_seen_sec. Report at most
-{{max_entities}} entities. Prioritise items that affect the walker's decision
-(pedestrians, moving vehicles, obstacles). {_JSON_RULES}
+Use the [t=Xs] markers to fill first_seen_sec / last_seen_sec. Do NOT
+put bare second numbers inside the ``label`` string; the label is a
+short noun phrase describing the entity ("pedestrian", "parked_car"),
+not a time-tagged sentence. Report at most {{max_entities}} entities.
+Prioritise items that affect the walker's decision (pedestrians,
+moving vehicles, obstacles). {_JSON_RULES}
 """
 
 
@@ -112,8 +115,14 @@ Static facts belong in entities, not events. Output JSON:
   ]
 }}
 
-Report at most {{max_events}} events; if nothing meaningful happens, return
-{{ "events": [] }}. {_JSON_RULES}
+Fill start_sec / end_sec from the [t=Xs] markers on the frames. Do NOT
+restate those numeric bounds inside the ``description`` prose — write
+the description in natural English ("a pedestrian crosses from the
+right"), not "at 3.0 seconds a pedestrian ...". The numeric bounds are
+for machines; the description is for humans.
+
+Report at most {{max_events}} events; if nothing meaningful happens,
+return {{ "events": [] }}. {_JSON_RULES}
 """
 
 
@@ -166,13 +175,28 @@ that text alone.
 
 Task: produce exactly {{num_qa}} question-answer pairs spanning the six
 conceptual layers (scene, entity, event, motion, risk, walkability).
-Cover as many distinct qa_type values as possible. Output JSON:
+Cover as many distinct qa_type values as possible.
+
+TEMPORAL PHRASING POLICY:
+  - Do NOT write bare second numbers in the ``question`` or ``answer``
+    strings. Frames are sampled sparsely (every ~1-2 s), so an exact
+    "between 8.8 and 16.2 seconds" claim is false precision that misleads
+    readers.
+  - Use relative English temporal phrasing instead: "early in the clip",
+    "as the escalator comes into view", "shortly after the pedestrian
+    crosses", "midway through", "near the end". Anchor to visible events
+    or landmarks, not to a stopwatch.
+  - The numeric ``evidence_start_sec`` / ``evidence_end_sec`` fields are
+    for machine use and MUST stay as floats; the phrasing policy applies
+    only to the human-readable ``question`` and ``answer`` strings.
+
+Output JSON:
 {{
   "qa": [
     {{
       "qa_type": "one of [{_tokens(QAType)}]",
-      "question": "<English question>",
-      "answer": "<English answer>",
+      "question": "<English question, no bare second numbers>",
+      "answer": "<English answer, no bare second numbers>",
       "evidence_entities": ["<entity label>", ...],
       "evidence_start_sec": <float or null>,
       "evidence_end_sec": <float or null>,

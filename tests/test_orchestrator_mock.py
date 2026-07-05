@@ -8,6 +8,7 @@ on PATH so the suite still runs on a minimal dev box.
 from __future__ import annotations
 
 import asyncio
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -23,6 +24,12 @@ from egoannot.vlm.mock import MockVLMClient
 
 def _ffmpeg_available() -> bool:
     return shutil.which("ffmpeg") is not None and shutil.which("ffprobe") is not None
+
+
+_BARE_SECOND_RANGE_RE = re.compile(
+    r"\bbetween\s+\d+(?:\.\d+)?\s+and\s+\d+(?:\.\d+)?\s+seconds?\b",
+    re.IGNORECASE,
+)
 
 
 @pytest.mark.skipif(not _ffmpeg_available(), reason="ffmpeg/ffprobe not on PATH")
@@ -66,3 +73,10 @@ def test_mock_end_to_end(tmp_pipeline: Path) -> None:
     assert len(payload["qa_pairs"]) >= 1
     # Mock caption is English.
     assert "walking" in payload["caption"].lower()
+
+    # Temporal-phrasing policy: no bare "between N and N seconds" pattern
+    # in questions/answers. The numeric evidence_time_span stays.
+    for qa in payload["qa_pairs"]:
+        assert not _BARE_SECOND_RANGE_RE.search(qa["question"]), qa
+        assert not _BARE_SECOND_RANGE_RE.search(qa["answer"]), qa
+

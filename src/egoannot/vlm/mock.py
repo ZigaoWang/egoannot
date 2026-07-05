@@ -103,7 +103,7 @@ _CANNED: dict[str, dict[str, Any]] = {
             },
             {
                 "qa_type": "risk",
-                "question": "Are there any dynamic obstacles ahead?",
+                "question": "Are there any dynamic obstacles ahead early in the clip?",
                 "answer": "Yes, a pedestrian is crossing ahead; medium risk.",
                 "evidence_entities": ["pedestrian"],
                 "evidence_start_sec": 3.0,
